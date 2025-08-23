@@ -1,0 +1,520 @@
+import numpy as np
+import pandas as pd
+import requests
+import time
+import json
+import websocket
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Callable
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+import logging
+
+# MT5 imports
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    print("Warning: MetaTrader5 package not installed. Install with: pip install MetaTrader5")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MarketData:
+    """Container for market data"""
+    symbol: str
+    price: float
+    timestamp: datetime
+    volume: Optional[float] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+
+@dataclass
+class TradingSignal:
+    """Trading signal from Markov model"""
+    symbol: str
+    direction: str  # 'BUY', 'SELL', 'HOLD'
+    confidence: float
+    predicted_state: int
+    timestamp: datetime
+
+class BrokerAPI(ABC):
+    """Abstract base class for broker APIs"""
+    
+    @abstractmethod
+    def connect(self) -> bool:
+        """Connect to broker API"""
+        pass
+    
+    @abstractmethod
+    def get_live_price(self, symbol: str) -> MarketData:
+        """Get current live price for symbol"""
+        pass
+    
+    @abstractmethod
+    def get_historical_data(self, symbol: str, period: str) -> pd.DataFrame:
+        """Get historical price data"""
+        pass
+    
+    @abstractmethod
+    def place_order(self, symbol: str, side: str, quantity: float, order_type: str = 'market') -> Dict:
+        """Place a trading order"""
+        pass
+
+class MT5API(BrokerAPI):
+    """MetaTrader 5 API implementation"""
+    
+    def __init__(self, login: int = None, password: str = None, server: str = None, path: str = None):
+        """
+        Initialize MT5 connection
+        
+        Args:
+            login: MT5 account number
+            password: MT5 account password
+            server: MT5 server name
+            path: Path to MT5 terminal (optional)
+        """
+        if not MT5_AVAILABLE:
+            raise ImportError("MetaTrader5 package not installed")
+            
+        self.login = login
+        self.password = password
+        self.server = server
+        self.path = path
+        self.connected = False
+        self.account_info = None
+        
+    def connect(self) -> bool:
+        """Connect to MT5 terminal"""
+        try:
+            # Initialize MT5 connection
+            if self.path:
+                if not mt5.initialize(path=self.path):
+                    logger.error(f"MT5 initialize failed: {mt5.last_error()}")
+                    return False
+            else:
+                if not mt5.initialize():
+                    logger.error(f"MT5 initialize failed: {mt5.last_error()}")
+                    return False
+            
+            # Login if credentials provided
+            if self.login and self.password and self.server:
+                if not mt5.login(self.login, self.password, self.server):
+                    logger.error(f"MT5 login failed: {mt5.last_error()}")
+                    return False
+            
+            # Get account information
+            self.account_info = mt5.account_info()
+            if self.account_info is None:
+                logger.error("Failed to get account info")
+                return False
+                
+            self.connected = True
+            logger.info(f"Connected to MT5. Account: {self.account_info.login}, Balance: {self.account_info.balance}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"MT5 connection error: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from MT5"""
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            logger.info("Disconnected from MT5")
+    
+    def get_live_price(self, symbol: str) -> MarketData:
+        """Get current live price from MT5"""
+        try:
+            if not self.connected:
+                logger.error("Not connected to MT5")
+                return MarketData(symbol, 0, datetime.now())
+            
+            # Get current tick
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                logger.error(f"Failed to get tick for {symbol}: {mt5.last_error()}")
+                return MarketData(symbol, 0, datetime.now())
+            
+            return MarketData(
+                symbol=symbol,
+                price=(tick.bid + tick.ask) / 2,  # Mid price
+                timestamp=datetime.fromtimestamp(tick.time),
+                volume=tick.volume if hasattr(tick, 'volume') else None,
+                bid=tick.bid,
+                ask=tick.ask
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting live price for {symbol}: {e}")
+            return MarketData(symbol, 0, datetime.now())
+    
+    def get_historical_data(self, symbol: str, period: str = 'D1', count: int = 1000) -> pd.DataFrame:
+        """
+        Get historical price data from MT5
+        
+        Args:
+            symbol: Trading symbol
+            period: Timeframe (M1, M5, M15, M30, H1, H4, D1, W1, MN1)
+            count: Number of bars to retrieve
+        """
+        try:
+            if not self.connected:
+                logger.error("Not connected to MT5")
+                return pd.DataFrame()
+            
+            # Map period string to MT5 timeframe
+            timeframe_map = {
+                'M1': mt5.TIMEFRAME_M1,
+                'M5': mt5.TIMEFRAME_M5,
+                'M15': mt5.TIMEFRAME_M15,
+                'M30': mt5.TIMEFRAME_M30,
+                'H1': mt5.TIMEFRAME_H1,
+                'H4': mt5.TIMEFRAME_H4,
+                'D1': mt5.TIMEFRAME_D1,
+                'W1': mt5.TIMEFRAME_W1,
+                'MN1': mt5.TIMEFRAME_MN1
+            }
+            
+            timeframe = timeframe_map.get(period, mt5.TIMEFRAME_D1)
+            
+            # Get historical rates
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+            if rates is None or len(rates) == 0:
+                logger.error(f"Failed to get rates for {symbol}: {mt5.last_error()}")
+                return pd.DataFrame()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(rates)
+            df['date'] = pd.to_datetime(df['time'], unit='s')
+            df = df[['date', 'open', 'high', 'low', 'close', 'tick_volume']]
+            df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+            
+            return df.sort_values('date').reset_index(drop=True)
+            
+        except Exception as e:
+            logger.error(f"Error getting historical data for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def place_order(self, symbol: str, side: str, quantity: float, order_type: str = 'market', 
+                   price: float = None, sl: float = None, tp: float = None, 
+                   deviation: int = 20, magic: int = 123456, comment: str = "Markov Trade") -> Dict:
+        """
+        Place a trading order in MT5
+        
+        Args:
+            symbol: Trading symbol
+            side: 'BUY' or 'SELL'
+            quantity: Lot size
+            order_type: 'market', 'limit', 'stop'
+            price: Order price (for limit/stop orders)
+            sl: Stop loss price
+            tp: Take profit price
+            deviation: Price deviation in points
+            magic: Magic number for order identification
+            comment: Order comment
+        """
+        try:
+            if not self.connected:
+                logger.error("Not connected to MT5")
+                return {'status': 'error', 'message': 'Not connected'}
+            
+            # Get symbol info
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                logger.error(f"Symbol {symbol} not found")
+                return {'status': 'error', 'message': f'Symbol {symbol} not found'}
+            
+            # Check if symbol is available for trading
+            if not symbol_info.visible:
+                if not mt5.symbol_select(symbol, True):
+                    logger.error(f"Failed to select symbol {symbol}")
+                    return {'status': 'error', 'message': f'Failed to select symbol {symbol}'}
+            
+            # Determine order type and action
+            if side.upper() == 'BUY':
+                if order_type.lower() == 'market':
+                    action = mt5.TRADE_ACTION_DEAL
+                    type_order = mt5.ORDER_TYPE_BUY
+                    price = mt5.symbol_info_tick(symbol).ask if price is None else price
+                elif order_type.lower() == 'limit':
+                    action = mt5.TRADE_ACTION_PENDING
+                    type_order = mt5.ORDER_TYPE_BUY_LIMIT
+                elif order_type.lower() == 'stop':
+                    action = mt5.TRADE_ACTION_PENDING
+                    type_order = mt5.ORDER_TYPE_BUY_STOP
+            else:  # SELL
+                if order_type.lower() == 'market':
+                    action = mt5.TRADE_ACTION_DEAL
+                    type_order = mt5.ORDER_TYPE_SELL
+                    price = mt5.symbol_info_tick(symbol).bid if price is None else price
+                elif order_type.lower() == 'limit':
+                    action = mt5.TRADE_ACTION_PENDING
+                    type_order = mt5.ORDER_TYPE_SELL_LIMIT
+                elif order_type.lower() == 'stop':
+                    action = mt5.TRADE_ACTION_PENDING
+                    type_order = mt5.ORDER_TYPE_SELL_STOP
+            
+            # Prepare order request
+            request = {
+                "action": action,
+                "symbol": symbol,
+                "volume": quantity,
+                "type": type_order,
+                "price": price,
+                "deviation": deviation,
+                "magic": magic,
+                "comment": comment,
+                "type_time": mt5.ORDER_TIME_GTC,  # Good till cancelled
+                "type_filling": mt5.ORDER_FILLING_IOC,  # Immediate or cancel
+            }
+            
+            # Add stop loss and take profit if provided
+            if sl is not None:
+                request["sl"] = sl
+            if tp is not None:
+                request["tp"] = tp
+            
+            # Send order
+            result = mt5.order_send(request)
+            if result is None:
+                logger.error(f"Order send failed: {mt5.last_error()}")
+                return {'status': 'error', 'message': f'Order send failed: {mt5.last_error()}'}
+            
+            # Check order result
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                logger.error(f"Order failed: {result.retcode} - {result.comment}")
+                return {
+                    'status': 'error',
+                    'message': f'Order failed: {result.retcode} - {result.comment}',
+                    'retcode': result.retcode
+                }
+            
+            logger.info(f"Order successful: {side} {quantity} {symbol} at {price}")
+            return {
+                'status': 'success',
+                'order_id': result.order,
+                'deal_id': result.deal,
+                'symbol': symbol,
+                'side': side,
+                'quantity': quantity,
+                'price': result.price,
+                'timestamp': datetime.now().isoformat(),
+                'comment': comment
+            }
+            
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    def get_positions(self, symbol: str = None) -> List[Dict]:
+        """Get open positions"""
+        try:
+            if not self.connected:
+                return []
+            
+            if symbol:
+                positions = mt5.positions_get(symbol=symbol)
+            else:
+                positions = mt5.positions_get()
+            
+            if positions is None:
+                return []
+            
+            position_list = []
+            for pos in positions:
+                position_list.append({
+                    'ticket': pos.ticket,
+                    'symbol': pos.symbol,
+                    'type': 'BUY' if pos.type == 0 else 'SELL',
+                    'volume': pos.volume,
+                    'price_open': pos.price_open,
+                    'price_current': pos.price_current,
+                    'profit': pos.profit,
+                    'comment': pos.comment,
+                    'time': datetime.fromtimestamp(pos.time)
+                })
+            
+            return position_list
+            
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            return []
+    
+    def close_position(self, ticket: int) -> Dict:
+        """Close a specific position"""
+        try:
+            if not self.connected:
+                return {'status': 'error', 'message': 'Not connected'}
+            
+            # Get position info
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                return {'status': 'error', 'message': 'Position not found'}
+            
+            position = positions[0]
+            
+            # Prepare close request
+            if position.type == 0:  # BUY position
+                action_type = mt5.ORDER_TYPE_SELL
+                price = mt5.symbol_info_tick(position.symbol).bid
+            else:  # SELL position
+                action_type = mt5.ORDER_TYPE_BUY
+                price = mt5.symbol_info_tick(position.symbol).ask
+            
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": position.symbol,
+                "volume": position.volume,
+                "type": action_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": 123456,
+                "comment": "Position close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                return {
+                    'status': 'error',
+                    'message': f'Close failed: {result.retcode} - {result.comment}'
+                }
+            
+            return {
+                'status': 'success',
+                'ticket': ticket,
+                'deal_id': result.deal,
+                'message': 'Position closed successfully'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    def get_account_info(self) -> Dict:
+        """Get account information"""
+        try:
+            if not self.connected:
+                return {}
+            
+            account = mt5.account_info()
+            if account is None:
+                return {}
+            
+            return {
+                'login': account.login,
+                'balance': account.balance,
+                'equity': account.equity,
+                'profit': account.profit,
+                'margin': account.margin,
+                'margin_free': account.margin_free,
+                'margin_level': account.margin_level,
+                'currency': account.currency,
+                'leverage': account.leverage
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting account info: {e}")
+            return {}
+
+class AdvancedMarkovTrader:
+    """Advanced trading system using complex multi-dimensional Markov chain predictions"""
+    
+    def __init__(self, broker_api: BrokerAPI, symbols: List[str]):
+        self.broker = broker_api
+        self.symbols = symbols
+        self.models = {}  # Complex Markov models for each symbol
+        self.price_history = {symbol: [] for symbol in symbols}
+        self.volume_history = {symbol: [] for symbol in symbols}
+        self.volatility_history = {symbol: [] for symbol in symbols}
+        self.signals = []
+        self.running = False
+        self.update_interval = 60  # seconds
+        
+        # Advanced model parameters
+        self.markov_order = 3  # Higher order Markov chain
+        self.n_return_states = 7  # More granular return states
+        self.n_volatility_states = 5  # Volatility states
+        self.n_volume_states = 3  # Volume states
+        self.regime_lookback = 50  # Days for regime detection
+        
+        # Risk management
+        self.max_risk_per_trade = 0.02  # 2% per trade
+        self.max_open_positions = 3
+        
+    def initialize_models(self, lookback_days: int = 250):
+        """Initialize complex multi-dimensional Markov models"""
+        logger.info("Initializing advanced Markov models...")
+        
+        for symbol in self.symbols:
+            try:
+                # Get historical data from MT5
+                hist_data = self.broker.get_historical_data(symbol, 'D1', lookback_days)
+                
+                if len(hist_data) > 100:  # More data required for complex model
+                    prices = hist_data['close'].values
+                    volumes = hist_data['volume'].values
+                    
+                    # Create comprehensive model
+                    model = self._create_advanced_markov_model(prices, volumes, hist_data)
+                    self.models[symbol] = model
+                    
+                    # Initialize histories
+                    self.price_history[symbol] = list(prices[-50:])
+                    self.volume_history[symbol] = list(volumes[-50:])
+                    
+                    # Calculate initial volatility history
+                    returns = np.diff(np.log(prices))
+                    volatility = self._calculate_rolling_volatility(returns, window=20)
+                    self.volatility_history[symbol] = list(volatility[-30:])
+                    
+                    logger.info(f"Advanced model initialized for {symbol}")
+                else:
+                    logger.warning(f"Insufficient data for {symbol}")
+                    
+            except Exception as e:
+                logger.error(f"Error initializing model for {symbol}: {e}")
+    
+    def _create_advanced_markov_model(self, prices: np.ndarray, volumes: np.ndarray, hist_data: pd.DataFrame) -> Dict:
+        """Create a sophisticated multi-dimensional Markov model"""
+        returns = np.diff(np.log(prices))
+        
+        # 1. Market Regime Detection using Hidden Markov Model approach
+        regimes = self._detect_market_regimes(returns, prices)
+        
+        # 2. Multi-dimensional state space
+        return_states = self._discretize_returns_adaptive(returns)
+        volatility_states = self._discretize_volatility(returns)
+        volume_states = self._discretize_volume(volumes)
+        
+        # 3. Combined state space (return, volatility, volume, regime)
+        combined_states = []
+        min_len = min(len(return_states), len(volatility_states), len(volume_states), len(regimes))
+        
+        for i in range(min_len):
+            combined_state = (
+                return_states[i],
+                volatility_states[i], 
+                volume_states[i],
+                regimes[i]
+            )
+            combined_states.append(combined_state)
+        
+        # 4. Higher-order transition matrices
+        transition_matrices = self._build_higher_order_transitions(combined_states)
+        
+        # 5. Volatility clustering model
+        volatility_model = self._build_volatility_clustering_model(returns)
+        
+        return {
+            'transition_matrices': transition_matrices,
+            'return_quantiles': np.quantile(returns, np.linspace(0, 1, self.n_return_states + 1)),
+            'volatile
